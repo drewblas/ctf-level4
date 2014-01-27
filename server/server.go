@@ -14,7 +14,7 @@ import (
 	"time"
 	"github.com/goraft/raft"
 	// "github.com/goraft/raftd/command"
-	"github.com/goraft/raftd/db"
+	// "github.com/goraft/raftd/db"
 	"bytes"
 	"encoding/json"
 )
@@ -29,7 +29,7 @@ type Server struct {
 	client     *transport.Client
 	cluster    *Cluster
 	raftServer raft.Server
-	db         *db.DB
+	queryLog   *QueryLog
 	connectionString string
 }
 
@@ -40,15 +40,6 @@ type Join struct {
 type JoinResponse struct {
 	Self    ServerAddress   `json:"self"`
 	Members []ServerAddress `json:"members"`
-}
-
-type Replicate struct {
-	Self  string `json:"self"`
-	Query []byte        `json:"query"`
-}
-
-type ReplicateResponse struct {
-	Self ServerAddress `json:"self"`
 }
 
 // Creates a new server.
@@ -69,7 +60,7 @@ func New(path, listen string) (*Server, error) {
 		router:  mux.NewRouter(),
 		client:  transport.NewClient(),
 		cluster: NewCluster(path, cs),
-		db:     db.New(),
+		queryLog:      NewQueryLog(),
 		connectionString: cs,
 	}
 
@@ -81,7 +72,7 @@ func (s *Server) raftInit(primary string) {
 
 	transporter := raft.NewHTTPTransporter("/raft")
 	// func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, ctx interface{}, connectionString string) (Server, error) {
-	s.raftServer, err = raft.NewServer(s.name, s.path, transporter, nil, s.db, s.connectionString)
+	s.raftServer, err = raft.NewServer(s.name, s.path, transporter, nil, s.queryLog, s.connectionString)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -157,7 +148,6 @@ func (s *Server) ListenAndServe(primary string) error {
 	
 
 	s.router.HandleFunc("/sql", s.sqlHandler).Methods("POST")
-	s.router.HandleFunc("/replicate", s.replicationHandler).Methods("POST")
 	s.router.HandleFunc("/healthcheck", s.healthcheckHandler).Methods("GET")
 	s.router.HandleFunc("/join", s.joinHandler).Methods("POST")
 	s.router.HandleFunc("/states", s.statesHandler).Methods("GET")
@@ -295,42 +285,15 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	r := &Replicate{
-		Self:  s.raftServer.Name(),
-		Query: query,
-	}
-	for _, member := range s.raftServer.Peers() {
-		b := util.JSONEncode(r)
-		_, err := s.client.SafePost(member.ConnectionString, "/replicate", b)
-		if err != nil {
-			log.Printf("Couldn't replicate query to %v: %s", member, err)
-		}
-	}
-
-	log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
-	w.Write(resp)
-}
-
-func (s *Server) replicationHandler(w http.ResponseWriter, req *http.Request) {
-	r := &Replicate{}
-	if err := util.JSONDecode(req.Body, r); err != nil {
-		log.Printf("Invalid replication request: %s", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("Handling replication request from %v", r.Self)
-
-	_, err := s.execute(r.Query)
+	i_resp, err := s.raftServer.Do(NewSqlCommand(query))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	resp := &ReplicateResponse{
-		s.cluster.self,
-	}
-	b := util.JSONEncode(resp)
-	w.Write(b.Bytes())
+	resp = i_resp.([]byte)
+
+	log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
+	w.Write(resp)
 }
 
 func (s *Server) healthcheckHandler(w http.ResponseWriter, req *http.Request) {
