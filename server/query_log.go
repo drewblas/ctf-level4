@@ -2,6 +2,11 @@ package server
 
 import (
   "sync"
+  "fmt"
+  "stripe-ctf.com/sqlcluster/log"
+  "stripe-ctf.com/sqlcluster/sql"
+  "stripe-ctf.com/sqlcluster/util"
+  "errors"
 )
 
 // The log of all queries
@@ -9,15 +14,17 @@ type QueryLog struct {
   sequenceNumber int
   queries  map[int][]byte
   responses map[int][]byte
+  sql        *sql.SQL
   mutex sync.RWMutex
 }
 
 // Creates a new database.
-func NewQueryLog() *QueryLog {
+func NewQueryLog(newsql *sql.SQL) *QueryLog {
   return &QueryLog{
     sequenceNumber: 0,
     queries: make(map[int][]byte),
     responses: make(map[int][]byte),
+    sql: newsql,
   }
 }
 
@@ -28,11 +35,37 @@ func (ql *QueryLog) GetResponse(idx int) []byte {
   return ql.responses[idx]
 }
 
-// Sets the value for a given key.
-func (ql *QueryLog) Record(sql []byte) int {
+func (ql *QueryLog) Execute(state string, query []byte) ([]byte, error) {
   ql.mutex.Lock()
   defer ql.mutex.Unlock()
   defer func() { ql.sequenceNumber += 1 }()
-  ql.queries[ql.sequenceNumber] = sql
-  return ql.sequenceNumber
+  ql.queries[ql.sequenceNumber] = query
+  
+
+  if state == "leader" || log.Verbose() {
+    log.Printf("[%s] [%d] Executing %#v", state, ql.sequenceNumber, string(query))
+  }
+
+  output, err := ql.sql.Execute(string(query))
+
+  if err != nil {
+    var msg string
+    if output != nil && len(output.Stderr) > 0 {
+      template := `Error executing %#v (%s)
+
+SQLite error: %s`
+      msg = fmt.Sprintf(template, query, err.Error(), util.FmtOutput(output.Stderr))
+    } else {
+      msg = err.Error()
+    }
+
+    return nil, errors.New(msg)
+  }
+
+  formatted := fmt.Sprintf("SequenceNumber: %d\n%s",
+    ql.sequenceNumber, output.Stdout)
+
+  ql.responses[ql.sequenceNumber] = []byte(formatted)
+
+  return []byte(formatted), nil
 }

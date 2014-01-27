@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
 	"io/ioutil"
@@ -25,7 +24,6 @@ type Server struct {
 	listen     string
 	router     *mux.Router
 	httpServer *http.Server
-	sql        *sql.SQL
 	client     *transport.Client
 	cluster    *Cluster
 	raftServer raft.Server
@@ -56,11 +54,10 @@ func New(path, listen string) (*Server, error) {
 		name:    listen,
 		path:    path,
 		listen:  listen,
-		sql:     sql.NewSQL(sqlPath),
 		router:  mux.NewRouter(),
 		client:  transport.NewClient(),
 		cluster: NewCluster(path, cs),
-		queryLog:      NewQueryLog(),
+		queryLog:      NewQueryLog(sql.NewSQL(sqlPath)),
 		connectionString: cs,
 	}
 
@@ -280,17 +277,13 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.Debugf("[%s] Received query: %#v", state, string(query))
-	resp, err := s.execute(query)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-	}
 
 	i_resp, err := s.raftServer.Do(NewSqlCommand(query))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	resp = i_resp.([]byte)
+	resp := i_resp.([]byte)
 
 	log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
 	w.Write(resp)
@@ -298,29 +291,6 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) healthcheckHandler(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) execute(query []byte) ([]byte, error) {
-	state := s.raftServer.State()
-	output, err := s.sql.Execute(state, string(query))
-
-	if err != nil {
-		var msg string
-		if output != nil && len(output.Stderr) > 0 {
-			template := `Error executing %#v (%s)
-
-SQLite error: %s`
-			msg = fmt.Sprintf(template, query, err.Error(), util.FmtOutput(output.Stderr))
-		} else {
-			msg = err.Error()
-		}
-
-		return nil, errors.New(msg)
-	}
-
-	formatted := fmt.Sprintf("SequenceNumber: %d\n%s",
-		output.SequenceNumber, output.Stdout)
-	return []byte(formatted), nil
 }
 
 // This is a hack around Gorilla mux not providing the correct net/http

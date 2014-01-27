@@ -18,7 +18,6 @@ type SQL struct {
 type Output struct {
 	Stdout         []byte
 	Stderr         []byte
-	SequenceNumber int
 }
 
 func NewSQL(path string) *SQL {
@@ -42,15 +41,10 @@ func getExitstatus(err error) int {
 	return status.ExitStatus()
 }
 
-func (sql *SQL) Execute(tag string, command string) (*Output, error) {
+func (sql *SQL) Execute(command string) (*Output, error) {
 	// TODO: make sure I can catch non-lock issuez
 	sql.mutex.Lock()
 	defer sql.mutex.Unlock()
-
-	defer func() { sql.sequenceNumber += 1 }()
-	if tag == "primary" || log.Verbose() {
-		log.Printf("[%s] [%d] Executing %#v", tag, sql.sequenceNumber, command)
-	}
 
 	subprocess := exec.Command("sqlite3", sql.path)
 	subprocess.Stdin = strings.NewReader(command + ";")
@@ -84,7 +78,6 @@ func (sql *SQL) Execute(tag string, command string) (*Output, error) {
 	output := &Output{
 		Stdout:         o,
 		Stderr:         e,
-		SequenceNumber: sql.sequenceNumber,
 	}
 
 	return output, nil

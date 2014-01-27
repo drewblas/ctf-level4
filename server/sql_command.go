@@ -29,6 +29,7 @@ func (c *SqlCommand) CommandName() string {
 // Writes a value to a key.
 func (c *SqlCommand) Apply(server raft.Server) (interface{}, error) {
   ql := server.Context().(*QueryLog)
-  i := ql.Record(c.Query)
-  return i, nil
+  state := server.State()
+  i, err := ql.Execute(state, c.Query)
+  return i, err
 }
