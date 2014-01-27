@@ -11,6 +11,7 @@ import (
 	"stripe-ctf.com/sqlcluster/server"
 	"syscall"
 	"time"
+	"github.com/goraft/raft"
 )
 
 func main() {
@@ -73,7 +74,11 @@ OPTIONS:
 		os.Exit(1)
 	}
 
-	log.SetVerbose(verbose)
+	log.SetVerbose(true)
+
+	if true {
+		raft.SetLogLevel(raft.Debug)
+	}
 
 	if directory == "" {
 		var err error
