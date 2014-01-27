@@ -52,8 +52,12 @@ func New(path, listen string) (*Server, error) {
 		return nil, err
 	}
 
+	// cs := "http://" + listen
+
 	sqlPath := filepath.Join(path, "storage.sql")
 	util.EnsureAbsent(sqlPath)
+
+	log.Println("STARTING path:", path, " listen:", listen, " cs: ", cs)
 
 	s := &Server{
 		name:    listen,
@@ -73,8 +77,11 @@ func (s *Server) raftInit(primary string) {
 	var err error
 
 	transporter := raft.NewHTTPTransporter("/raft")
-	// func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, ctx interface{}, connectionString string) (Server, error) {
+	transporter.Transport.Dial = transport.UnixDialer
+	// transporter.Transport = &http.Transport{Dial: transport.UnixDialer, DisableKeepAlives: false}
 	s.raftServer, err = raft.NewServer(s.name, s.path, transporter, nil, s.queryLog, s.connectionString)
+	// func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, ctx interface{}, connectionString string) (Server, error) {
+	
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -111,30 +118,6 @@ func (s *Server) raftInit(primary string) {
 	}
 }
 
-func (s *Server) clusterInit(primary string) {
-	// var err error
-
-	if primary == "" {
-		s.cluster.Init()
-	} else {
-		s.Join(primary)
-		go func() {
-			for {
-				if s.healthcheckPrimary() {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-
-				s.cluster.PerformFailover()
-
-				if s.cluster.State() == "primary" {
-					break
-				}
-			}
-		}()
-	}
-}
-
 // Starts the server.
 func (s *Server) ListenAndServe(primary string) error {
 	var err error
@@ -144,10 +127,7 @@ func (s *Server) ListenAndServe(primary string) error {
 	// Initialize and start HTTP server.
 	s.httpServer = &http.Server{
 		Handler: s.router,
-	}
-
-	// s.clusterInit(primary)
-	
+	}	
 
 	s.router.HandleFunc("/sql", s.sqlHandler).Methods("POST")
 	s.router.HandleFunc("/healthcheck", s.healthcheckHandler).Methods("GET")
@@ -192,8 +172,13 @@ func (s *Server) Join(leader string) error {
 
 	var b bytes.Buffer
 	json.NewEncoder(&b).Encode(command)
-	resp, err := http.Post(fmt.Sprintf("http://%s/join", leader), "application/json", &b)
-	resp.Body.Close()
+
+	cs, _ := transport.Encode(leader)
+	log.Println("[RAFT SLAVE] Posting to ", cs, " ** ", leader)
+
+	// resp, err := http.Post(fmt.Sprintf("http://%s/join", leader), "application/json", &b)
+	// resp.Body.Close()
+	_, err := s.client.SafePost(cs, "/join", &b)
 	if err != nil {
 		return err
 	}
@@ -208,6 +193,9 @@ func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Println("[RAFT LEADER] Received Join: ", command.Name, " - ", command.ConnectionString)
+
 	if _, err := s.raftServer.Do(command); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -245,7 +233,8 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	log.Debugf("[%s] Received query: %#v", state, string(query))	
+	log.Debugf("[%s] Received query: %#v", state, string(query))
+	log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
 
 	if state != "leader" {
 		// http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
@@ -260,10 +249,20 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 
+		if cs == "" {
+			log.Printf("No Leader found!")
+			log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
+
+			http.Error(w, "No Leader found!", http.StatusInternalServerError)
+			return
+		}
+
 		body, err := s.client.SafePost(cs, "/passalong", strings.NewReader(string(query)))
 
 		if err != nil {
 			log.Printf("Couldn't pass-along query to %v: %s", cs, err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		r := &PassalongResponse{}
