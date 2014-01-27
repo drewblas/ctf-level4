@@ -19,6 +19,8 @@ import (
 	"strings"
 )
 
+var allowPassalong = false
+
 type Server struct {
 	name       string
 	path       string
@@ -206,6 +208,8 @@ func (s *Server) passalongHandler(w http.ResponseWriter, req *http.Request) {
 	state := s.raftServer.State()
 	query, err := ioutil.ReadAll(req.Body)
 
+	log.Debugf("[%s] Received passalong query: %#v", state, string(query))
+
 	i_resp, err := s.raftServer.Do(NewSqlCommand(query))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -233,64 +237,66 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	log.Debugf("[%s] Received query: %#v", state, string(query))
-	log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
+	log.Debugf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
 
 	if state != "leader" {
-		// http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
-		// return
 		////////////////   SLAVE
+		if allowPassalong {	
 
-		leader := s.raftServer.Leader()
-		var cs string
-		for name, member := range s.raftServer.Peers() {
-			if name == leader {
-				cs = member.ConnectionString
-			}
-		}
-
-		if cs == "" {
-			log.Printf("No Leader found!")
-			log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
-
-			http.Error(w, "No Leader found!", http.StatusInternalServerError)
-			return
-		}
-
-		body, err := s.client.SafePost(cs, "/passalong", strings.NewReader(string(query)))
-
-		if err != nil {
-			log.Printf("Couldn't pass-along query to %v: %s", cs, err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		r := &PassalongResponse{}
-		if err := util.JSONDecode(body, r); err != nil {
-			log.Printf("Invalid passalong response: %s", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		var resp []byte
-
-		for i := 0; i < 5; i++ {
-			time.Sleep(100 * time.Millisecond)
-
-			resp = s.queryLog.GetResponse(r.SequenceNumber)
-
-			if resp != nil {
-				break
+			leader := s.raftServer.Leader()
+			var cs string
+			for name, member := range s.raftServer.Peers() {
+				if name == leader {
+					cs = member.ConnectionString
+				}
 			}
 
-			log.Printf("Still waiting on passalong...")
-		}
+			if cs == "" {
+				log.Printf("No Leader found!")
+				log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
 
-		log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
-		w.Write(resp)
+				http.Error(w, "No Leader found!", http.StatusInternalServerError)
+				return
+			}
+
+			body, err := s.client.SafePost(cs, "/passalong", strings.NewReader(string(query)))
+
+			if err != nil {
+				log.Printf("Couldn't pass-along query to %v: %s", cs, err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			r := &PassalongResponse{}
+			if err := util.JSONDecode(body, r); err != nil {
+				log.Printf("Invalid passalong response: %s", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			var resp []byte
+
+			for i := 0; i < 5; i++ {
+				time.Sleep(100 * time.Millisecond)
+
+				resp = s.queryLog.GetResponse(r.SequenceNumber)
+
+				if resp != nil {
+					break
+				}
+
+				log.Printf("Still waiting on passalong...")
+			}
+
+			log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
+			w.Write(resp)
+		}else{
+			http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
+			return
+		}
 	}else{
 		////////////////   MASTER / PRIMARY / LEADER
-		
+		log.Debugf("[%s] Received query: %#v", state, string(query))
 
 		i_resp, err := s.raftServer.Do(NewSqlCommand(query))
 		if err != nil {
