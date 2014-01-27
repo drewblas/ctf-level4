@@ -16,6 +16,7 @@ import (
 	// "github.com/goraft/raftd/db"
 	"bytes"
 	"encoding/json"
+	"strings"
 )
 
 type Server struct {
@@ -38,6 +39,10 @@ type Join struct {
 type JoinResponse struct {
 	Self    ServerAddress   `json:"self"`
 	Members []ServerAddress `json:"members"`
+}
+
+type PassalongResponse struct {
+	SequenceNumber int `json:"sequence"`
 }
 
 // Creates a new server.
@@ -148,6 +153,7 @@ func (s *Server) ListenAndServe(primary string) error {
 	s.router.HandleFunc("/healthcheck", s.healthcheckHandler).Methods("GET")
 	s.router.HandleFunc("/join", s.joinHandler).Methods("POST")
 	s.router.HandleFunc("/states", s.statesHandler).Methods("GET")
+	s.router.HandleFunc("/passalong", s.passalongHandler).Methods("POST")
 
 	// Start Unix transport
 	l, err := transport.Listen(s.listen)
@@ -208,85 +214,96 @@ func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// Join an existing cluster
-func (s *Server) JoinOld(primary string) error {
-	join := &Join{Self: s.cluster.self}
-	b := util.JSONEncode(join)
+func (s *Server) passalongHandler(w http.ResponseWriter, req *http.Request) {
+	state := s.raftServer.State()
+	query, err := ioutil.ReadAll(req.Body)
 
-	cs, err := transport.Encode(primary)
+	i_resp, err := s.raftServer.Do(NewSqlCommand(query))
 	if err != nil {
-		return err
-	}
-
-	for {
-		body, err := s.client.SafePost(cs, "/join", b)
-		if err != nil {
-			log.Printf("Unable to join cluster: %s", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		resp := &JoinResponse{}
-		if err = util.JSONDecode(body, &resp); err != nil {
-			return err
-		}
-
-		s.cluster.Join(resp.Self, resp.Members)
-		return nil
-	}
-}
-
-// Server handlers
-func (s *Server) joinHandlerOld(w http.ResponseWriter, req *http.Request) {
-	j := &Join{}
-	if err := util.JSONDecode(req.Body, j); err != nil {
-		log.Printf("Invalid join request: %s", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Handling join request: %#v", j)
+	executedQuery := i_resp.(*ExecutedQuery)
 
-	// Add node to the cluster
-	if err := s.cluster.AddMember(j.Self); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
+	log.Debugf("[%s] Returning passalong response to %#v: %#v", state, string(query), executedQuery.SequenceNumber)
 
-	// Respond with the current cluster description
-	resp := &JoinResponse{
-		s.cluster.self,
-		s.cluster.members,
-	}
+	resp := &PassalongResponse{ executedQuery.SequenceNumber }
 	b := util.JSONEncode(resp)
 	w.Write(b.Bytes())
 }
+
 
 // This is the only user-facing function, and accordingly the body is
 // a raw string rather than JSON.
 func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 	state := s.raftServer.State()
-	if state != "leader" {
-		http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
-		return
-	}
-
 	query, err := ioutil.ReadAll(req.Body)
+
 	if err != nil {
 		log.Printf("Couldn't read body: %s", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
-	log.Debugf("[%s] Received query: %#v", state, string(query))
+	log.Debugf("[%s] Received query: %#v", state, string(query))	
 
-	i_resp, err := s.raftServer.Do(NewSqlCommand(query))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if state != "leader" {
+		// http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
+		// return
+		////////////////   SLAVE
+
+		leader := s.raftServer.Leader()
+		var cs string
+		for name, member := range s.raftServer.Peers() {
+			if name == leader {
+				cs = member.ConnectionString
+			}
+		}
+
+		body, err := s.client.SafePost(cs, "/passalong", strings.NewReader(string(query)))
+
+		if err != nil {
+			log.Printf("Couldn't pass-along query to %v: %s", cs, err)
+		}
+
+		r := &PassalongResponse{}
+		if err := util.JSONDecode(body, r); err != nil {
+			log.Printf("Invalid passalong response: %s", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var resp []byte
+
+		for i := 0; i < 5; i++ {
+			time.Sleep(100 * time.Millisecond)
+
+			resp = s.queryLog.GetResponse(r.SequenceNumber)
+
+			if resp != nil {
+				break
+			}
+
+			log.Printf("Still waiting on passalong...")
+		}
+
+		log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
+		w.Write(resp)
+	}else{
+		////////////////   MASTER / PRIMARY / LEADER
+		
+
+		i_resp, err := s.raftServer.Do(NewSqlCommand(query))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+
+		executedQuery := i_resp.(*ExecutedQuery)
+		resp := executedQuery.Response
+
+		log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
+		w.Write(resp)
 	}
-
-	resp := i_resp.([]byte)
-
-	log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
-	w.Write(resp)
 }
 
 func (s *Server) healthcheckHandler(w http.ResponseWriter, req *http.Request) {

@@ -30,6 +30,6 @@ func (c *SqlCommand) CommandName() string {
 func (c *SqlCommand) Apply(server raft.Server) (interface{}, error) {
   ql := server.Context().(*QueryLog)
   state := server.State()
-  i, err := ql.Execute(state, c.Query)
-  return i, err
+  iface, err := ql.Execute(state, c.Query)
+  return iface, err
 }

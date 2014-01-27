@@ -9,6 +9,12 @@ import (
   "errors"
 )
 
+type ExecutedQuery struct {
+  SequenceNumber int
+  Query []byte
+  Response []byte
+}
+
 // The log of all queries
 type QueryLog struct {
   sequenceNumber int
@@ -35,7 +41,7 @@ func (ql *QueryLog) GetResponse(idx int) []byte {
   return ql.responses[idx]
 }
 
-func (ql *QueryLog) Execute(state string, query []byte) ([]byte, error) {
+func (ql *QueryLog) Execute(state string, query []byte) (*ExecutedQuery, error) {
   ql.mutex.Lock()
   defer ql.mutex.Unlock()
   defer func() { ql.sequenceNumber += 1 }()
@@ -67,5 +73,5 @@ SQLite error: %s`
 
   ql.responses[ql.sequenceNumber] = []byte(formatted)
 
-  return []byte(formatted), nil
+  return &ExecutedQuery{ql.sequenceNumber, query, []byte(formatted)}, nil
 }
