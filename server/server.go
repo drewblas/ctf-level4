@@ -20,6 +20,7 @@ import (
 )
 
 var allowPassalong = false
+var loopLimit = 15
 
 type Server struct {
 	name       string
@@ -81,7 +82,10 @@ func (s *Server) raftInit(primary string) {
 	transporter := raft.NewHTTPTransporter("/raft")
 	transporter.Transport.Dial = transport.UnixDialer
 	// transporter.Transport = &http.Transport{Dial: transport.UnixDialer, DisableKeepAlives: false}
+
 	s.raftServer, err = raft.NewServer(s.name, s.path, transporter, nil, s.queryLog, s.connectionString)
+	s.raftServer.SetHeartbeatInterval( 100 * time.Millisecond )
+	s.raftServer.SetElectionTimeout( 300 * time.Millisecond )
 	// func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, ctx interface{}, connectionString string) (Server, error) {
 	
 	if err != nil {
@@ -180,12 +184,17 @@ func (s *Server) Join(leader string) error {
 
 	// resp, err := http.Post(fmt.Sprintf("http://%s/join", leader), "application/json", &b)
 	// resp.Body.Close()
-	_, err := s.client.SafePost(cs, "/join", &b)
-	if err != nil {
-		return err
+	var err error
+
+	for i := 0; i < loopLimit; i++ {
+		_, err = s.client.SafePost(cs, "/join", &b)
+		if err == nil {
+			return nil
+		}
+		log.Debugln("[RAFT SLAVE] Join post failed, trying again...")
 	}
 
-	return nil
+	return err
 }
 
 func (s *Server) joinHandler(w http.ResponseWriter, req *http.Request) {
@@ -226,6 +235,18 @@ func (s *Server) passalongHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 
+func (s *Server) leaderConnectionString() (cs string) {
+	leader := s.raftServer.Leader()
+
+	for name, member := range s.raftServer.Peers() {
+		if name == leader {
+			cs = member.ConnectionString
+		}
+	}
+
+	return cs
+}
+
 // This is the only user-facing function, and accordingly the body is
 // a raw string rather than JSON.
 func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
@@ -240,23 +261,18 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 	log.Debugf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
 
 	if state != "leader" {
+		var cs string
 		////////////////   SLAVE
 		if allowPassalong {	
+			for i := 0; i < loopLimit; i++ {
+				cs = s.leaderConnectionString()
 
-			leader := s.raftServer.Leader()
-			var cs string
-			for name, member := range s.raftServer.Peers() {
-				if name == leader {
-					cs = member.ConnectionString
+				if cs != "" {
+					break
 				}
-			}
 
-			if cs == "" {
-				log.Printf("No Leader found!")
-				log.Printf( fmt.Sprintf("Leader: %v, State: %v, Peers: %v", s.raftServer.Leader(), s.raftServer.State(), s.raftServer.Peers()) )
-
-				http.Error(w, "No Leader found!", http.StatusInternalServerError)
-				return
+				time.Sleep(100 * time.Millisecond)
+				log.Printf("Still waiting on leader...")
 			}
 
 			body, err := s.client.SafePost(cs, "/passalong", strings.NewReader(string(query)))
@@ -276,21 +292,21 @@ func (s *Server) sqlHandler(w http.ResponseWriter, req *http.Request) {
 
 			var resp []byte
 
-			for i := 0; i < 5; i++ {
+			for i := 0; i < loopLimit; i++ {
 				time.Sleep(100 * time.Millisecond)
-
 				resp = s.queryLog.GetResponse(r.SequenceNumber)
 
-				if resp != nil {
+				if resp != nil && string(resp) != "" {
 					break
 				}
 
 				log.Printf("Still waiting on passalong...")
 			}
 
-			log.Debugf("[%s] Returning response to %#v: %#v", state, string(query), string(resp))
+			log.Debugf("[%s] [%d] Returning response to %#v: %#v", state, r.SequenceNumber, string(query), string(resp))
 			w.Write(resp)
 		}else{
+			time.Sleep(1 * time.Second)
 			http.Error(w, "Only the primary can service queries, but this is a "+state, http.StatusBadRequest)
 			return
 		}

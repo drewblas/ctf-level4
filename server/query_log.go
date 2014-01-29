@@ -46,11 +46,6 @@ func (ql *QueryLog) Execute(state string, query []byte) (*ExecutedQuery, error) 
   defer ql.mutex.Unlock()
   defer func() { ql.sequenceNumber += 1 }()
   ql.queries[ql.sequenceNumber] = query
-  
-
-  if state == "leader" || log.Verbose() {
-    log.Printf("[%s] [%d] Executing %#v", state, ql.sequenceNumber, string(query))
-  }
 
   output, err := ql.sql.Execute(string(query))
 
@@ -70,6 +65,10 @@ SQLite error: %s`
 
   formatted := fmt.Sprintf("SequenceNumber: %d\n%s",
     ql.sequenceNumber, output.Stdout)
+
+  if state == "leader" || log.Verbose() {
+    log.Printf("[%s] [%d] Executed %#v - Response %#v", state, ql.sequenceNumber, string(query), formatted)
+  }
 
   ql.responses[ql.sequenceNumber] = []byte(formatted)
 
